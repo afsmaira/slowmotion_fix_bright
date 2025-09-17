@@ -1,2 +1,4 @@
-# slowmotion_fix_bright
-Fixes slowmotion bright variations due to electric lights illumination.
+# Brightness SlowMotion Fix
+Fixes slowmotion brightness variations due to electric lights illumination.
+
+# Under development...
