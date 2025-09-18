@@ -1,5 +1,6 @@
 import argparse
 import os
+import math
 
 import cv2
 import numpy as np
@@ -7,10 +8,132 @@ import numpy as np
 from tqdm import tqdm
 from typing import Tuple, Dict
 
+import concurrent.futures
+
+
+def analyze_frame_worker(args):
+    """
+    Worker function to analyze a chunk of frames for a given mode.
+    """
+    video_path, start_frame, end_frame, mode, params = args
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    chunk_data = []
+
+    for _ in range(start_frame, end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if mode == 'slice':
+            orientation = params['orientation']
+            num_divisions = params['slices']
+
+            if orientation == 'vertical':
+                slice_width = width // num_divisions
+                frame_data = [np.mean(gray[:, i*slice_width : width if i == num_divisions-1 else (i+1)*slice_width]) for i in range(num_divisions)]
+            else:
+                row_height = height // num_divisions
+                frame_data = [np.mean(gray[i*row_height : height if i == num_divisions-1 else (i+1)*row_height, :]) for i in range(num_divisions)]
+            chunk_data.append(frame_data)
+
+        elif mode == 'grid':
+            cols, rows = params['grid_dims']
+            cell_w = width // cols
+            cell_h = height // rows
+            frame_data = np.zeros((rows, cols))
+            for r in range(rows):
+                for c in range(cols):
+                    start_y, end_y = r * cell_h, height if r == rows - 1 else (r + 1) * cell_h
+                    start_x, end_x = c * cell_w, width if c == cols - 1 else (c + 1) * cell_w
+                    cell = gray[start_y:end_y, start_x:end_x]
+                    if cell.size > 0:
+                        frame_data[r, c] = np.mean(cell)
+            chunk_data.append(frame_data)
+
+    cap.release()
+    return np.array(chunk_data)
+
+
+def correct_frames_worker(args):
+    """
+    Worker function to correct a chunk of frames.
+    """
+    video_path, start_frame, end_frame, mode, params, brightness_data, max_brightness = args
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    corrected_frames = []
+
+    for frame_idx in range(start_frame, end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        corrected = frame.copy()
+
+        if mode == 'slice':
+            orientation = params['orientation']
+            num_divisions = params['slices']
+
+            if orientation == 'vertical':
+                slice_width = width // num_divisions
+                for i in range(num_divisions):
+                    factor = max_brightness[i] / brightness_data[frame_idx, i] if brightness_data[frame_idx, i] > 0 else 1
+                    start_x = i * slice_width
+                    end_x = width if i == num_divisions - 1 else (i + 1) * slice_width
+                    region = corrected[:, start_x:end_x]
+                    corrected[:, start_x:end_x] = np.clip(region.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+            else:
+                row_height = height // num_divisions
+                for i in range(num_divisions):
+                    factor = max_brightness[i] / brightness_data[frame_idx, i] if brightness_data[frame_idx, i] > 0 else 1
+                    start_y = i * row_height
+                    end_y = height if i == num_divisions - 1 else (i + 1) * row_height
+                    region = corrected[start_y:end_y, :]
+                    corrected[start_y:end_y, :] = np.clip(region.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+        elif mode == 'grid':
+            cols, rows = params['grid_dims']
+            cell_w = width // cols
+            cell_h = height // rows
+            for r in range(rows):
+                for c in range(cols):
+                    current_b = brightness_data[frame_idx, r, c]
+                    if current_b > 0:
+                        factor = max_brightness[r, c] / current_b
+                        start_y, end_y = r * cell_h, height if r == rows - 1 else (r + 1) * cell_h
+                        start_x, end_x = c * cell_w, width if c == cols - 1 else (c + 1) * cell_w
+                        region = corrected[start_y:end_y, start_x:end_x]
+                        if region.size > 0:
+                            corrected[start_y:end_y, start_x:end_x] = np.clip(region.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+        corrected_frames.append(corrected)
+
+    cap.release()
+    return corrected_frames
+
 
 class FlickerFixer:
     def __init__(self, input_path: str, output_path: str, mode: str = 'grid',
-                 slices: int = 20, grid_dims: tuple = (15, 20)):
+                 slices: int = 20, grid_dims: Tuple[int, int] = (15, 20),
+                 workers: int = 0, chunk_size: int = 10,
+                 slice_orientation: str = "vertical"):
         """
         Creates an instance of FlickerFixer
         :param input_path: Path of input file
@@ -24,10 +147,12 @@ class FlickerFixer:
         self.num_slices = slices
         self.mode = mode
         self.grid_dims = grid_dims
-        print(self.mode, self.grid_dims, self.num_slices)
         self.props = {}
         self.brightness_data = None
         self.max_brightness = None
+        self.workers = workers if workers > 0 else os.cpu_count() or 1
+        self.chunk_frames = chunk_size
+        self.slice_orientation = slice_orientation
 
     def getProps(self):
         """
@@ -47,121 +172,62 @@ class FlickerFixer:
         print(f"Video properties: {self.props['width']}x{self.props['height']}, "
               f"{self.props['frame_count']} frames, {self.props['fps']:.2f} FPS.")
 
-    def slice_idxs(self, i, j=None):
-        if self.mode == 'slices':
-            slice_width = self.props['width'] // self.num_slices
-            return ((i * slice_width),
-                    ((i + 1) * slice_width
-                     if i < self.num_slices - 1
-                     else self.props['width']))
-        slice_width = self.props['width'] // self.grid_dims[0]
-        slice_height = self.props['height'] // self.grid_dims[1]
-        return ((i * slice_width),
-                ((i + 1) * slice_width
-                 if i < self.grid_dims[0] - 1
-                 else self.props['width']),
-                (j * slice_height),
-                 ((j + 1) * slice_height
-                  if j < self.grid_dims[1] - 1
-                  else self.props['height']))
-
-    def _analyze_slices(self, cap):
-        brightness_data_list = []
-        for _ in tqdm(range(self.props['frame_count']), desc="Analyzing frames"):
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            current_frame_brightness = []
-            for i in range(self.num_slices):
-                start_x, end_x = self.slice_idxs(i)
-                avg_brightness = np.mean(gray_frame[:, start_x:end_x])
-                current_frame_brightness.append(avg_brightness)
-            brightness_data_list.append(current_frame_brightness)
-
-        self.brightness_data = np.array(brightness_data_list)
-        self.max_brightness_per_slice = np.max(self.brightness_data, axis=0)
-
-    def _analyze_grid(self, cap):
-        cols, rows = self.grid_dims
-        data = np.zeros((self.props['frame_count'], rows, cols))
-
-        for frame_idx in tqdm(range(self.props['frame_count']), desc="Analyzing (grid mode)"):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            for r in range(rows):
-                for c in range(cols):
-                    start_x, end_x, start_y, end_y = self.slice_idxs(c, r)
-                    cell = gray[start_y:end_y, start_x:end_x]
-                    data[frame_idx, r, c] = np.mean(cell)
-        self.brightness_data = data
-        self.max_brightness = np.max(self.brightness_data, axis=0)
-
     def analyze(self):
-        """
-        First pass: Analyzes the video to gather brightness data for each slice
-        """
-        print("\n--- Starting Step 1: Brightness Analysis ---")
-        cap = cv2.VideoCapture(self.input)
-        if self.mode == 'slices':
-            self._analyze_slices(cap)
+        print(f"\n--- Starting Step 1: Analyzing frames in parallel ({self.mode} mode) ---")
+
+        frame_count = self.props['frame_count']
+        chunk_size = math.ceil(frame_count / self.workers)
+        tasks = []
+
+        if self.mode == 'slice':
+            params = {'slices': self.num_slices, 'orientation': self.slice_orientation}
         else:
-            self._analyze_grid(cap)
-        cap.release()
-        print("--- Analysis complete. Reference brightness values calculated. ---")
+            params = {'grid_dims': self.grid_dims}
 
-    def _process_slices(self, cap, out):
-        for frame_idx in tqdm(range(self.props['frame_count']), desc="Writing fixed frames"):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            corrected_frame = frame.copy()
-            for slice_idx in range(self.num_slices):
-                current_brightness = self.brightness_data[frame_idx, slice_idx]
-                target_brightness = self.max_brightness_per_slice[slice_idx]
-                correction_factor = target_brightness / current_brightness if current_brightness > 0 else 1.0
+        for start_frame in range(0, frame_count, self.chunk_frames):
+            end_frame = min(start_frame + self.chunk_frames, frame_count)
+            if start_frame >= end_frame:
+                continue
+            tasks.append((self.input, start_frame, end_frame, self.mode, params))
 
-                start_x, end_x = self.slice_idxs(slice_idx)
-                corrected_slice_float = frame[:, start_x:end_x].astype(np.float32) * correction_factor
-                corrected_frame[:, start_x:end_x] = np.clip(corrected_slice_float, 0, 255).astype(np.uint8)
+        all_chunks_data = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.workers) as executor:
+            results = list(tqdm(executor.map(analyze_frame_worker, tasks), total=len(tasks), desc="Analyzing chunks"))
+            for chunk_result in results:
+                if chunk_result is not None:
+                    all_chunks_data.append(chunk_result)
 
-            out.write(corrected_frame)
+        self.brightness_data = np.vstack(all_chunks_data)
+        self.max_brightness = np.max(self.brightness_data, axis=0)
+        print("--- Analysis complete. ---")
 
-    def _process_grid(self, cap, out):
-        cols, rows = self.grid_dims
-        for frame_idx in tqdm(range(self.props['frame_count']), desc="Correcting (grid mode)"):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            corrected = frame.copy()
-            for r in range(rows):
-                for c in range(cols):
-                    current_brightness = self.brightness_data[frame_idx, r, c]
-                    if current_brightness > 0:
-                        factor = self.max_brightness[r, c] / current_brightness
-                        start_x, end_x, start_y, end_y = self.slice_idxs(c, r)
-                        region = corrected[start_y:end_y, start_x:end_x]
-                        corrected[start_y:end_y, start_x:end_x] = np.clip(region.astype(np.float32) * factor, 0, 255).astype(np.uint8)
-            out.write(corrected)
 
     def process(self):
-        """
-        Second pass: Applies correction based on analysis and writes the new video.
-        """
-        print("\n--- Starting Step 2: Applying Correction & Writing Video ---")
-        cap = cv2.VideoCapture(self.input)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(self.output, fourcc, self.props['fps'],
-                              (self.props['width'], self.props['height']))
-        if self.mode == 'slices':
-            self._process_slices(cap, out)
-        else:
-            self._process_grid(cap, out)
+        print(f"\n--- Starting Step 2: Correcting frames in parallel and writing video ---")
 
-        cap.release()
+        frame_count = self.props['frame_count']
+        tasks = []
+
+        if self.mode == 'slice':
+            params = {'slices': self.num_slices, 'orientation': self.slice_orientation}
+        else:
+            params = {'grid_dims': self.grid_dims}
+        for start_frame in range(0, frame_count, self.chunk_frames):
+            end_frame = min(start_frame + self.chunk_frames, frame_count)
+            if start_frame >= end_frame:
+                continue
+            tasks.append((self.input, start_frame, end_frame, self.mode, params, self.brightness_data, self.max_brightness))
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(self.output, fourcc, self.props['fps'], (self.props['width'], self.props['height']))
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.workers) as executor:
+            # executor.map garante que os resultados cheguem na ordem em que as tarefas foram enviadas
+            for corrected_frames_chunk in tqdm(executor.map(correct_frames_worker, tasks), total=len(tasks), desc="Correcting chunks"):
+                if corrected_frames_chunk:
+                    for frame in corrected_frames_chunk:
+                        out.write(frame)
+
         out.release()
         cv2.destroyAllWindows()
 
@@ -200,22 +266,33 @@ def process_input() -> Dict[str, str | int | Tuple[int, int]]:
         "-m", "--mode",
         type=str,
         default="grid",
-        choices=['slice', 'grid'],
-        help="Correction mode.\n'slice' for vertical slices, 'grid' for a grid of regions.\nDefault: grid"
+        choices=['slice', 'grid', 'full'],
+        help="Correction mode.\n"
+             "'slice': for vertical/horizontal slices.\n"
+             "'grid': for a grid of regions.\n"
+             "'full': analyzes the entire frame as one region.\n"
+             "Default: grid"
     )
 
     group = parser.add_mutually_exclusive_group()
+    parser.add_argument(
+        "--slice-orientation",
+        type=str,
+        default="vertical",
+        choices=['vertical', 'horizontal'],
+        help="[slice mode] Orientation of the slices.\nDefault: vertical"
+    )
     group.add_argument(
-        "-s", "--slices",
+        "-d", "--divisions",
         type=int,
-        help="Number of vertical slices to analyze.\n"
+        help="[slice mode] Number of vertical slices to analyze.\n"
              "More slices provide more localized correction but might introduce artifacts."
     )
     group.add_argument(
-        "-w", "--slice-width",
+        "-w", "--division-size",
         type=int,
         default=20,
-        help="Specify the width of each slice in pixels.\n"
+        help="[slice mode] Specify the width of each slice in pixels.\n"
              "This is an alternative to --slices. The number of slices will be calculated automatically.\n"
              "Default: 20"
     )
@@ -233,6 +310,20 @@ def process_input() -> Dict[str, str | int | Tuple[int, int]]:
         help="[grid mode] Size of each grid cell in pixels as WIDTHxHEIGHT (e.g., '20x20').\nDefault: 20x20"
     )
 
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of CPU cores to use for processing.\nDefault: 0 (uses all available cores)."
+    )
+
+    parser.add_argument(
+        "-c", "--chunk-size",
+        type=int,
+        default=10,
+        help="Number of frames per parallel task.\nSmaller values give a smoother progress bar and less use of RAM but may add overhead.\nDefault: 10"
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -242,32 +333,47 @@ def process_input() -> Dict[str, str | int | Tuple[int, int]]:
         base, ext = os.path.splitext(args.input)
         args.output = f"{base}_fixed.mp4"
 
-    if args.mode == 'slice':
-        if args.slice_width:
+    ret = {'input_path': args.input,
+           'output_path': args.output,
+           'mode': args.mode,
+           'workers': args.workers,
+           'chunk_size': args.chunk_size
+           }
+    if args.mode == 'full':
+        print("Using full frame (1x1 grid) correction mode.")
+        ret['mode'] = 'grid'
+        ret['grid_dims'] = (1, 1)
+    elif args.mode == 'slice':
+        if args.division_size:
             cap = cv2.VideoCapture(args.input)
             if not cap.isOpened():
                 raise Exception("Input video file cannot be opened.")
             video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             cap.release()
 
-            if args.slice_width <= 0:
+            if args.division_size <= 0:
                 raise ValueError("Slice width must be a positive integer.")
-            args.slice_width = min(video_width, args.slice_width)
-            num_slices = video_width // args.slice_width
-            print(f"Using slice width of {args.slice_width}px, resulting in {num_slices} slices for this video.")
-            if video_width % args.slice_width != 0:
-                print(
-                    f"Warning: Video width ({video_width}px) is not perfectly divisible by slice width. The last slice will be wider.")
+            if args.slice_orientation == 'vertical':
+                args.division_size = min(video_width, args.division_size)
+                num_slices = video_width // args.division_size
+                if video_width % args.division_size != 0:
+                    print(
+                        f"Warning: Video width ({video_width}px) is not perfectly divisible by slice width. The last slice will be wider.")
+            else:
+                args.division_size = min(video_height, args.division_size)
+                num_slices = video_height // args.division_size
+                if video_height % args.division_size != 0:
+                    print(
+                        f"Warning: Video height ({video_height}px) is not perfectly divisible by slice height. The last slice will be higher.")
+            print(f"Using slice size of {args.division_size}px, resulting in {num_slices} slices for this video.")
 
         else:
             num_slices = args.slices
             print(f"Using {num_slices} vertical slices.")
 
-        return {'input_path': args.input,
-                'output_path': args.output,
-                'mode': args.mode,
-                'slices': num_slices
-                }
+        ret['slices'] = num_slices
+        ret['slice_orientation'] = args.slice_orientation
 
     elif args.mode == 'grid':
         if args.grid_cell_size:
@@ -296,13 +402,11 @@ def process_input() -> Dict[str, str | int | Tuple[int, int]]:
             nums_grid = tuple(map(int, args.grid_size.split('x')))
             print(f"Using dimensions {nums_grid} for the grid.")
 
-        return {'input_path': args.input,
-                'output_path': args.output,
-                'mode': args.mode,
-                'grid_dims': nums_grid
-                }
+        ret['grid_dims'] = nums_grid
     else:
         raise ValueError('Mode must be either "grid" or "slices"')
+
+    return ret
 
 
 if __name__ == '__main__':
