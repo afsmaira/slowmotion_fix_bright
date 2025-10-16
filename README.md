@@ -10,7 +10,7 @@ pip3 install git+https://github.com/afsmaira/slowmotion_fix_bright.git
 
 And run
 ```bash
-slowmotion_fix_bright --help
+fixbright --help
 ```
 
 # Under development...
