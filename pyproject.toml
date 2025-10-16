@@ -27,4 +27,4 @@ dependencies = [
 Homepage = "https://github.com/afsmaira/slowmotion_fix_bright"
 
 [project.scripts]
-photos2timelapse = "slowmotion_fix_bright.main:main"
+fixbright = "slowmotion_fix_bright.main:main"
