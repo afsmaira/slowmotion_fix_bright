@@ -5,12 +5,12 @@ Stabilizes brightness variations (flicker) in slow-motion video caused by artifi
 
 Prepare the environment
 ```bash
-pip3 install -e .
+pip3 install git+https://github.com/afsmaira/slowmotion_fix_bright.git
 ```
 
 And run
 ```bash
-python3 run.py
+slowmotion_fix_bright --help
 ```
 
 # Under development...

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slowmotion_fix_bright"
+version = "0.1.0"
+authors = [
+    { name="André de Freitas Smaira", email="andre.smaira@gmail.com" },
+]
+description = "This tool stabilizes brightness variations (flicker) in slow-motion video caused by artificial lighting. The function operates on the assumption that the scene is mostly static, meaning the average brightness across all image regions should remain constant over time."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "tqdm",
+]
+
+[project.urls]
+Homepage = "https://github.com/afsmaira/slowmotion_fix_bright"
+
+[project.scripts]
+photos2timelapse = "slowmotion_fix_bright.main:main"
